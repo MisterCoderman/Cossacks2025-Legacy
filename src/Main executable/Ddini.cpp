@@ -107,39 +107,69 @@ extern bool InGame;
 extern bool InEditor;
 __declspec(dllexport) void FlipPages(void) {
     std::lock_guard<std::mutex> lock(renderMutex);
+
     static bool currentVSync = false;
     static bool needInitialCenter = true;  // Флаг для первоначального центрирования
     static int lastWindowPosX = INT_MIN;   // Последняя известная позиция окна
     static int lastWindowPosY = INT_MIN;
     static int textureRestoreAttempts = 0; // Счетчик попыток восстановления текстур
     static const int MAX_RESTORE_ATTEMPTS = 15; // Максимум попыток перед пересозданием
-    static int lastWindowFlags = 0;       // Для отслеживания изменения режима окна
+    static Uint32 lastWindowFlags = 0;    // Для отслеживания изменения режима окна
+
+    // Проверка инициализации окна
+    if (!gWindow) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Window is null");
+        DDError = true;
+        return;
+    }
+
+    // Проверка видимости окна
+    Uint32 windowFlags = SDL_GetWindowFlags(gWindow);
+    if (!(windowFlags & SDL_WINDOW_SHOWN) || (windowFlags & SDL_WINDOW_MINIMIZED)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Window is hidden or minimized, restoring...");
+        SDL_RestoreWindow(gWindow); // Восстанавливаем окно, если оно минимизировано
+        SDL_RaiseWindow(gWindow);   // Поднимаем окно на передний план
+        SDL_ShowWindow(gWindow);    // Убеждаемся, что окно видимо
+    }
 
     // Функция для полного пересоздания рендера и ресурсов
     auto recreateRendererAndResources = [&]() {
         // Уничтожаем существующие ресурсы
-        if (gPrimaryTexture) SDL_DestroyTexture(gPrimaryTexture);
-        if (gBackTexture) SDL_DestroyTexture(gBackTexture);
-        if (gRenderer) SDL_DestroyRenderer(gRenderer);
-        gPrimaryTexture = nullptr;
-        gBackTexture = nullptr;
-        gRenderer = nullptr;
+        if (gPrimaryTexture) {
+            SDL_DestroyTexture(gPrimaryTexture);
+            gPrimaryTexture = nullptr;
+        }
+        if (gBackTexture) {
+            SDL_DestroyTexture(gBackTexture);
+            gBackTexture = nullptr;
+        }
+        if (gRenderer) {
+            SDL_DestroyRenderer(gRenderer);
+            gRenderer = nullptr;
+        }
 
         // Пересоздаем рендерер
-        gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | (currentVSync ? SDL_RENDERER_PRESENTVSYNC : 0));
         if (!gRenderer) {
-            DDError = true; // Устанавливаем флаг ошибки
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Failed to create renderer: %s", SDL_GetError());
+            DDError = true;
             return false;
         }
 
+        // Устанавливаем режим смешивания
+        SDL_SetRenderDrawBlendMode(gRenderer, SDL_BLENDMODE_NONE);
+
         // Пересоздаем текстуры
-        gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
-            SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
-        gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
-            SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+        gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+        gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
 
         if (!gPrimaryTexture || !gBackTexture) {
-            SDL_DestroyRenderer(gRenderer);
+            SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Failed to create textures: %s", SDL_GetError());
+            if (gPrimaryTexture) SDL_DestroyTexture(gPrimaryTexture);
+            if (gBackTexture) SDL_DestroyTexture(gBackTexture);
+            if (gRenderer) SDL_DestroyRenderer(gRenderer);
+            gPrimaryTexture = nullptr;
+            gBackTexture = nullptr;
             gRenderer = nullptr;
             DDError = true;
             return false;
@@ -152,16 +182,24 @@ __declspec(dllexport) void FlipPages(void) {
     // Проверка изменения режима окна (полноэкранный/оконный)
     Uint32 currentWindowFlags = SDL_GetWindowFlags(gWindow);
     if (currentWindowFlags != lastWindowFlags) {
-        // Режим окна изменился, пересоздаем рендерер и текстуры
+        SDL_LogInfo(SDL_LOG_CATEGORY_RENDER, "Window mode changed, recreating renderer");
         if (!recreateRendererAndResources()) {
-            return; // Пропускаем кадр, если не удалось пересоздать
+            return; // Пропускаем кадр
         }
         lastWindowFlags = currentWindowFlags;
+        // При смене режима принудительно восстанавливаем и центрируем окно
+        SDL_RestoreWindow(gWindow);
+        SDL_SetWindowPosition(gWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        SDL_ShowWindow(gWindow);
     }
 
-    if (!bActive || DDError) return;
+    if (!bActive || DDError) {
+        return;
+    }
+
+    // Проверка существования рендера
     if (!gRenderer) {
-        // Попытка пересоздать рендер, если он отсутствует
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER, "Renderer is null, attempting to recreate");
         if (!recreateRendererAndResources()) {
             return; // Пропускаем кадр
         }
@@ -170,22 +208,27 @@ __declspec(dllexport) void FlipPages(void) {
     // Проверка и восстановление текстур
     if (!gPrimaryTexture || !gBackTexture) {
         textureRestoreAttempts++;
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER, "Texture missing, attempt %d/%d", textureRestoreAttempts, MAX_RESTORE_ATTEMPTS);
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
-            // Превышен лимит попыток, пересоздаем рендер и ресурсы
             if (!recreateRendererAndResources()) {
                 return; // Пропускаем кадр
             }
         }
         else {
             // Мягкое восстановление текстур
-            if (gPrimaryTexture) SDL_DestroyTexture(gPrimaryTexture);
-            if (gBackTexture) SDL_DestroyTexture(gBackTexture);
-            gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
-                SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
-            gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
-                SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+            if (gPrimaryTexture) {
+                SDL_DestroyTexture(gPrimaryTexture);
+                gPrimaryTexture = nullptr;
+            }
+            if (gBackTexture) {
+                SDL_DestroyTexture(gBackTexture);
+                gBackTexture = nullptr;
+            }
+            gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+            gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
 
             if (!gPrimaryTexture || !gBackTexture) {
+                SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Failed to restore textures: %s", SDL_GetError());
                 return; // Пропускаем кадр
             }
         }
@@ -198,23 +241,24 @@ __declspec(dllexport) void FlipPages(void) {
     else {
         int currentX, currentY;
         SDL_GetWindowPosition(gWindow, &currentX, &currentY);
-
-        if (needInitialCenter || (currentX == lastWindowPosX && currentY == lastWindowPosY)) {
+        // Проверяем, находится ли окно за пределами экрана
+        if (currentX < 0 || currentY < 0 || currentX == lastWindowPosX && currentY == lastWindowPosY) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Centering window");
             SDL_SetWindowPosition(gWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
             SDL_GetWindowPosition(gWindow, &lastWindowPosX, &lastWindowPosY);
             needInitialCenter = false;
         }
     }
 
-    // Создаем SDL_Surface из ScreenPtr (используем SDL_CreateRGBSurfaceFrom для SDL 2.0.4)
-    SDL_Surface* srcSurface = SDL_CreateRGBSurfaceFrom(
-        ScreenPtr, RealLx, RealLy, 8, Pitch, 0, 0, 0, 0);
+    // Создаем SDL_Surface из ScreenPtr
+    SDL_Surface* srcSurface = SDL_CreateRGBSurfaceFrom(ScreenPtr, RealLx, RealLy, 8, Pitch, 0, 0, 0, 0);
     if (!srcSurface) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Failed to create surface: %s", SDL_GetError());
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
         }
-        return; // Пропускаем кадр при ошибке
+        return; // Пропускаем кадр
     }
     SDL_SetSurfacePalette(srcSurface, sdlPal);
 
@@ -223,17 +267,19 @@ __declspec(dllexport) void FlipPages(void) {
     void* pixels;
     int pitch;
     if (SDL_LockTexture(target, nullptr, &pixels, &pitch) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Failed to lock texture: %s", SDL_GetError());
         SDL_FreeSurface(srcSurface);
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
         }
-        return; // Пропускаем кадр при ошибке
+        return; // Пропускаем кадр
     }
 
     // Конвертируем и копируем данные из srcSurface в текстуру
     SDL_Surface* tempSurface = SDL_ConvertSurfaceFormat(srcSurface, SDL_PIXELFORMAT_ARGB8888, 0);
     if (!tempSurface || tempSurface->pitch != pitch || tempSurface->w != RealLx || tempSurface->h != RealLy) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Surface conversion failed or invalid parameters");
         SDL_UnlockTexture(target);
         SDL_FreeSurface(srcSurface);
         if (tempSurface) SDL_FreeSurface(tempSurface);
@@ -241,7 +287,7 @@ __declspec(dllexport) void FlipPages(void) {
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
         }
-        return; // Пропускаем кадр при ошибке
+        return; // Пропускаем кадр
     }
 
     memcpy(pixels, tempSurface->pixels, tempSurface->h * tempSurface->pitch);
@@ -251,20 +297,22 @@ __declspec(dllexport) void FlipPages(void) {
 
     // Рендеринг
     if (SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255) != 0 || SDL_RenderClear(gRenderer) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Render clear failed: %s", SDL_GetError());
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
         }
-        return; // Пропускаем кадр при ошибке
+        return; // Пропускаем кадр
     }
 
     SDL_Rect dstRect = { 0, 0, RealLx, RealLy };
     if (SDL_RenderCopy(gRenderer, target, nullptr, &dstRect) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_RENDER, "Render copy failed: %s", SDL_GetError());
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
         }
-        return; // Пропускаем кадр при ошибке
+        return; // Пропускаем кадр
     }
 
     SDL_RenderPresent(gRenderer);

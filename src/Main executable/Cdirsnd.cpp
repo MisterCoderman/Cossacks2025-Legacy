@@ -92,20 +92,24 @@ CDirSound::~CDirSound() {
 }
 
 void CDirSound::ReleaseAll() {
-    for (UINT x = 1; x <= m_currentBufferNum; ++x) {
-        if (m_bufferPointers[x]) {
-            Mix_FreeChunk(m_bufferPointers[x]);
-            m_bufferPointers[x] = NULL;
-        }
+    // Останавливаем все каналы
+    Mix_HaltChannel(-1);
+
+    // Вместо Mix_FreeChunk просто обнуляем, чтобы не крашилось
+    for (UINT x = 0; x < m_currentBufferNum; ++x) {
+        m_bufferPointers[x] = nullptr;
         m_channels[x] = -1;
     }
-    if (m_pDirectSoundObj) {
+
+    // Закрываем аудио
+    if (m_pDirectSoundObj != nullptr) {
         Mix_CloseAudio();
-        SDL_Quit();
-        m_pDirectSoundObj = NULL;
+        m_pDirectSoundObj = nullptr;
     }
+
     memset(BufIsRun, 0, sizeof(BufIsRun));
 }
+
 
 UINT CDirSound::CreateSoundBuffer(CWave* pWave) {
     if (m_currentBufferNum == MAXSND)
