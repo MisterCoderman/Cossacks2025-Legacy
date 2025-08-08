@@ -1,6 +1,5 @@
 ﻿// ==============================================
 // Эмулятор DirectDraw на базе SDL2
-// Версия для Windows XP
 // MR.CODERMAN 2025
 // ==============================================
 #include <algorithm>
@@ -141,136 +140,142 @@ __declspec(dllexport) void FlipPages(void) {
     static bool needInitialCenter = true;  // Флаг для первоначального центрирования
     static int lastWindowPosX = INT_MIN;   // Последняя известная позиция окна
     static int lastWindowPosY = INT_MIN;
+    static int textureRestoreAttempts = 0; // Счетчик попыток восстановления текстур
+    static const int MAX_RESTORE_ATTEMPTS = 15; // Максимум попыток перед пересозданием
 
-    // Обновление VSync с учетом и игры, и редактора
-    if (gRenderer && (currentVSync != (InGame || InEditor))) {
-        Uint32 rendererFlags = SDL_RENDERER_ACCELERATED;
-        if (InGame || InEditor) {
-            rendererFlags |= SDL_RENDERER_PRESENTVSYNC;
-        }
-        // Сохраняем текущие текстуры
-        SDL_Texture* tempPrimaryTexture = gPrimaryTexture;
-        SDL_Texture* tempBackTexture = gBackTexture;
+    // Функция для полного пересоздания рендера и ресурсов
+    auto recreateRendererAndResources = [&]() {
+        // Уничтожаем существующие ресурсы
+        if (gPrimaryTexture) SDL_DestroyTexture(gPrimaryTexture);
+        if (gBackTexture) SDL_DestroyTexture(gBackTexture);
+        if (gRenderer) SDL_DestroyRenderer(gRenderer);
         gPrimaryTexture = nullptr;
         gBackTexture = nullptr;
-        // Уничтожаем текущий рендер
-        SDL_DestroyRenderer(gRenderer);
-        // Создаем новый рендер с нужным флагом VSync
-        gRenderer = SDL_CreateRenderer(gWindow, -1, rendererFlags);
+        gRenderer = nullptr;
+
+        // Пересоздаем рендер
+        gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!gRenderer) {
-            char err[256], msg[256];
-            sprintf(err, "SDL_CreateRenderer failed: %s", SDL_GetError());
-            ConvertUTF8ToWindows1251(err, msg, 256);
-            MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
-            gPrimaryTexture = tempPrimaryTexture;
-            gBackTexture = tempBackTexture;
-            return;
+            return false; // Не удалось создать рендер
         }
-        // Восстанавливаем текстуры
-        gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
-        gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
-        if (!gPrimaryTexture || !gBackTexture) {
-            char err[256], msg[256];
-            sprintf(err, "SDL_CreateTexture failed: %s", SDL_GetError());
-            ConvertUTF8ToWindows1251(err, msg, 256);
-            MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
-            SDL_DestroyTexture(tempPrimaryTexture);
-            SDL_DestroyTexture(tempBackTexture);
-            return;
-        }
-        // Уничтожаем временные текстуры
-        SDL_DestroyTexture(tempPrimaryTexture);
-        SDL_DestroyTexture(tempBackTexture);
-        currentVSync = (InGame || InEditor);
-    }
 
-
-    if (!bActive || DDError) return;
-    if (!gRenderer) return;
-    if (!gPrimaryTexture || !gBackTexture) {
+        // Пересоздаем текстуры
         gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
         gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
 
         if (!gPrimaryTexture || !gBackTexture) {
-            return;
+            SDL_DestroyRenderer(gRenderer);
+            gRenderer = nullptr;
+            return false;
+        }
+
+        textureRestoreAttempts = 0; // Сбрасываем счетчик попыток
+        return true;
+    };
+
+    // Обновление VSync с учетом игры и редактора
+    if (gRenderer && (currentVSync != (InGame || InEditor))) {
+        if (SDL_RenderSetVSync(gRenderer, (InGame || InEditor) ? 1 : 0) == 0) {
+            currentVSync = (InGame || InEditor);
+        }
+    }
+
+    if (!bActive || DDError) return;
+    if (!gRenderer) {
+        // Попытка пересоздать рендер, если он отсутствует
+        if (!recreateRendererAndResources()) {
+            return; // Пропускаем кадр, если не удалось пересоздать
+        }
+    }
+
+    // Проверка и восстановление текстур
+    if (!gPrimaryTexture || !gBackTexture) {
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            // Превышен лимит попыток, пересоздаем рендер и ресурсы
+            if (!recreateRendererAndResources()) {
+                return; // Пропускаем кадр, если не удалось пересоздать
+            }
+        }
+        else {
+            // Мягкое восстановление текстур
+            if (gPrimaryTexture) SDL_DestroyTexture(gPrimaryTexture);
+            if (gBackTexture) SDL_DestroyTexture(gBackTexture);
+            gPrimaryTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
+                SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+            gBackTexture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_ARGB8888,
+                SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
+
+            if (!gPrimaryTexture || !gBackTexture) {
+                return; // Пропускаем кадр, чтобы попробовать снова
+            }
         }
     }
 
     // Логика центрирования окна
     if (InGame || InEditor) {
-        needInitialCenter = true;  // При входе в игру/редактор разрешаем новое центрирование
+        needInitialCenter = true;  // Разрешаем центрирование при входе в игру/редактор
     }
     else {
-        // Получаем текущую позицию окна
         int currentX, currentY;
         SDL_GetWindowPosition(gWindow, &currentX, &currentY);
 
-        // Если позиция не определена или окно нужно центрировать
         if (needInitialCenter || (currentX == lastWindowPosX && currentY == lastWindowPosY)) {
-            // Принудительное центрирование с обновлением позиции
             SDL_SetWindowPosition(gWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-            SDL_GetWindowPosition(gWindow, &lastWindowPosX, &lastWindowPosY);  // Запоминаем новую позицию
+            SDL_GetWindowPosition(gWindow, &lastWindowPosX, &lastWindowPosY);
             needInitialCenter = false;
         }
     }
 
-    // Создаем SDL_Surface из ScreenPtr с использованием Pitch
+    // Создаем SDL_Surface из ScreenPtr
     SDL_Surface* srcSurface = SDL_CreateRGBSurfaceWithFormatFrom(
         ScreenPtr, RealLx, RealLy, 8, Pitch, SDL_PIXELFORMAT_INDEX8);
     if (!srcSurface) {
-        char err[256], msg[256];
-        sprintf(err, "SDL_CreateRGBSurfaceWithFormatFrom failed: %s", SDL_GetError());
-        ConvertUTF8ToWindows1251(err, msg, 256);
-        MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
-        return;
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            recreateRendererAndResources();
+        }
+        return; // Пропускаем кадр при ошибке
     }
     SDL_SetSurfacePalette(srcSurface, sdlPal);
 
-    // Обновление текстуры через SDL_Surface
+    // Обновление текстуры
     SDL_Texture* target = window_mode ? gBackTexture : gPrimaryTexture;
-    void* pixels;
-    int pitch;
-    if (SDL_LockTexture(target, nullptr, &pixels, &pitch) != 0) {
-        char err[256], msg[256];
-        sprintf(err, "SDL_LockTexture failed: %s", SDL_GetError());
-        ConvertUTF8ToWindows1251(err, msg, 256);
-        MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
+    SDL_Surface* targetSurface;
+    if (SDL_LockTextureToSurface(target, nullptr, &targetSurface) != 0) {
         SDL_FreeSurface(srcSurface);
-        return;
-    }
-    // Копируем данные из srcSurface в текстуру
-    for (int y = 0; y < RealLy; y++) {
-        Uint8* srcRow = (Uint8*)srcSurface->pixels + y * srcSurface->pitch;
-        Uint32* dstRow = (Uint32*)((Uint8*)pixels + y * pitch);
-        for (int x = 0; x < RealLx; x++) {
-            Uint8 index = srcRow[x];
-            SDL_Color color = GPal[index];
-            dstRow[x] = (color.a << 24) | (color.r << 16) | (color.g << 8) | color.b;
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            recreateRendererAndResources();
         }
+        return; // Пропускаем кадр при ошибке
     }
+    SDL_BlitSurface(srcSurface, nullptr, targetSurface, nullptr);
     SDL_UnlockTexture(target);
     SDL_FreeSurface(srcSurface);
 
+    // Рендеринг
     if (SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255) != 0 || SDL_RenderClear(gRenderer) != 0) {
-        char err[256], msg[256];
-        sprintf(err, "SDL render setup failed: %s", SDL_GetError());
-        ConvertUTF8ToWindows1251(err, msg, 256);
-        MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
-        return;
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            recreateRendererAndResources();
+        }
+        return; // Пропускаем кадр при ошибке
     }
 
     SDL_Rect dstRect = { 0, 0, RealLx, RealLy };
     if (SDL_RenderCopy(gRenderer, target, NULL, &dstRect) != 0) {
-        char err[256], msg[256];
-        sprintf(err, "SDL_RenderCopy failed: %s", SDL_GetError());
-        ConvertUTF8ToWindows1251(err, msg, 256);
-        MessageBoxA(NULL, msg, "SDL Error", MB_OK | MB_ICONERROR);
-        return;
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            recreateRendererAndResources();
+        }
+        return; // Пропускаем кадр при ошибке
     }
 
     SDL_RenderPresent(gRenderer);
+    textureRestoreAttempts = 0; // Сбрасываем счетчик после успешного рендеринга
 }
 
 void LockSurface(void) {
