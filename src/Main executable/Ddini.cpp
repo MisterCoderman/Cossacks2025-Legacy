@@ -8,7 +8,6 @@
 #include <thread>
 #include <mutex>
 #include <windows.h>
-#include <psapi.h>
 #define __ddini_cpp_
 #include "ddini.h"
 #include "ResFile.h"
@@ -61,33 +60,6 @@ std::mutex renderMutex;
 extern bool PalDone;
 extern word PlayerMenuMode;
 
-// Проверка использования памяти процесса (в байтах)
-size_t GetProcessMemoryUsage() {
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        return pmc.WorkingSetSize;
-    }
-    return 0;
-}
-
-// Функция перезапуска текущего процесса
-bool RestartProcess() {
-    char exePath[MAX_PATH];
-    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH)) {
-        return false;
-    }
-    STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    BOOL success = CreateProcessA(exePath, GetCommandLineA(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-    if (!success) {
-        return false;
-    }
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    ExitProcess(0);
-    return true;
-}
-
 static void ConvertUTF8ToWindows1251(const char* utf8Str, char* outBuf, int outBufSize) {
     WCHAR wideBuf[256];
     int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, wideBuf, 256);
@@ -133,7 +105,6 @@ void ClearRGB() {
 
 extern bool InGame;
 extern bool InEditor;
-
 __declspec(dllexport) void FlipPages(void) {
     std::lock_guard<std::mutex> lock(renderMutex);
     static bool currentVSync = false;
@@ -142,6 +113,7 @@ __declspec(dllexport) void FlipPages(void) {
     static int lastWindowPosY = INT_MIN;
     static int textureRestoreAttempts = 0; // Счетчик попыток восстановления текстур
     static const int MAX_RESTORE_ATTEMPTS = 15; // Максимум попыток перед пересозданием
+    static int lastWindowFlags = 0;       // Для отслеживания изменения режима окна
 
     // Функция для полного пересоздания рендера и ресурсов
     auto recreateRendererAndResources = [&]() {
@@ -153,10 +125,11 @@ __declspec(dllexport) void FlipPages(void) {
         gBackTexture = nullptr;
         gRenderer = nullptr;
 
-        // Пересоздаем рендер
+        // Пересоздаем рендерер
         gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!gRenderer) {
-            return false; // Не удалось создать рендер
+            DDError = true; // Устанавливаем флаг ошибки
+            return false;
         }
 
         // Пересоздаем текстуры
@@ -168,6 +141,7 @@ __declspec(dllexport) void FlipPages(void) {
         if (!gPrimaryTexture || !gBackTexture) {
             SDL_DestroyRenderer(gRenderer);
             gRenderer = nullptr;
+            DDError = true;
             return false;
         }
 
@@ -175,18 +149,21 @@ __declspec(dllexport) void FlipPages(void) {
         return true;
     };
 
-    // Обновление VSync с учетом игры и редактора
-    if (gRenderer && (currentVSync != (InGame || InEditor))) {
-        if (SDL_RenderSetVSync(gRenderer, (InGame || InEditor) ? 1 : 0) == 0) {
-            currentVSync = (InGame || InEditor);
+    // Проверка изменения режима окна (полноэкранный/оконный)
+    Uint32 currentWindowFlags = SDL_GetWindowFlags(gWindow);
+    if (currentWindowFlags != lastWindowFlags) {
+        // Режим окна изменился, пересоздаем рендерер и текстуры
+        if (!recreateRendererAndResources()) {
+            return; // Пропускаем кадр, если не удалось пересоздать
         }
+        lastWindowFlags = currentWindowFlags;
     }
 
     if (!bActive || DDError) return;
     if (!gRenderer) {
         // Попытка пересоздать рендер, если он отсутствует
         if (!recreateRendererAndResources()) {
-            return; // Пропускаем кадр, если не удалось пересоздать
+            return; // Пропускаем кадр
         }
     }
 
@@ -196,7 +173,7 @@ __declspec(dllexport) void FlipPages(void) {
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             // Превышен лимит попыток, пересоздаем рендер и ресурсы
             if (!recreateRendererAndResources()) {
-                return; // Пропускаем кадр, если не удалось пересоздать
+                return; // Пропускаем кадр
             }
         }
         else {
@@ -209,7 +186,7 @@ __declspec(dllexport) void FlipPages(void) {
                 SDL_TEXTUREACCESS_STREAMING, RealLx, RealLy);
 
             if (!gPrimaryTexture || !gBackTexture) {
-                return; // Пропускаем кадр, чтобы попробовать снова
+                return; // Пропускаем кадр
             }
         }
     }
@@ -229,9 +206,9 @@ __declspec(dllexport) void FlipPages(void) {
         }
     }
 
-    // Создаем SDL_Surface из ScreenPtr
-    SDL_Surface* srcSurface = SDL_CreateRGBSurfaceWithFormatFrom(
-        ScreenPtr, RealLx, RealLy, 8, Pitch, SDL_PIXELFORMAT_INDEX8);
+    // Создаем SDL_Surface из ScreenPtr (используем SDL_CreateRGBSurfaceFrom для SDL 2.0.4)
+    SDL_Surface* srcSurface = SDL_CreateRGBSurfaceFrom(
+        ScreenPtr, RealLx, RealLy, 8, Pitch, 0, 0, 0, 0);
     if (!srcSurface) {
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
@@ -243,8 +220,9 @@ __declspec(dllexport) void FlipPages(void) {
 
     // Обновление текстуры
     SDL_Texture* target = window_mode ? gBackTexture : gPrimaryTexture;
-    SDL_Surface* targetSurface;
-    if (SDL_LockTextureToSurface(target, nullptr, &targetSurface) != 0) {
+    void* pixels;
+    int pitch;
+    if (SDL_LockTexture(target, nullptr, &pixels, &pitch) != 0) {
         SDL_FreeSurface(srcSurface);
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
@@ -252,9 +230,24 @@ __declspec(dllexport) void FlipPages(void) {
         }
         return; // Пропускаем кадр при ошибке
     }
-    SDL_BlitSurface(srcSurface, nullptr, targetSurface, nullptr);
+
+    // Конвертируем и копируем данные из srcSurface в текстуру
+    SDL_Surface* tempSurface = SDL_ConvertSurfaceFormat(srcSurface, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (!tempSurface || tempSurface->pitch != pitch || tempSurface->w != RealLx || tempSurface->h != RealLy) {
+        SDL_UnlockTexture(target);
+        SDL_FreeSurface(srcSurface);
+        if (tempSurface) SDL_FreeSurface(tempSurface);
+        textureRestoreAttempts++;
+        if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
+            recreateRendererAndResources();
+        }
+        return; // Пропускаем кадр при ошибке
+    }
+
+    memcpy(pixels, tempSurface->pixels, tempSurface->h * tempSurface->pitch);
     SDL_UnlockTexture(target);
     SDL_FreeSurface(srcSurface);
+    SDL_FreeSurface(tempSurface);
 
     // Рендеринг
     if (SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255) != 0 || SDL_RenderClear(gRenderer) != 0) {
@@ -266,7 +259,7 @@ __declspec(dllexport) void FlipPages(void) {
     }
 
     SDL_Rect dstRect = { 0, 0, RealLx, RealLy };
-    if (SDL_RenderCopy(gRenderer, target, NULL, &dstRect) != 0) {
+    if (SDL_RenderCopy(gRenderer, target, nullptr, &dstRect) != 0) {
         textureRestoreAttempts++;
         if (textureRestoreAttempts >= MAX_RESTORE_ATTEMPTS) {
             recreateRendererAndResources();
@@ -277,7 +270,6 @@ __declspec(dllexport) void FlipPages(void) {
     SDL_RenderPresent(gRenderer);
     textureRestoreAttempts = 0; // Сбрасываем счетчик после успешного рендеринга
 }
-
 void LockSurface(void) {
     std::lock_guard<std::mutex> lock(renderMutex);
     if (DDError) return;
@@ -343,13 +335,6 @@ bool EnumModesOnly() {
     return NModes > 0;
 }
 
-bool IsRunningUnderWine_ByNtDll() {
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    if (!ntdll) return false;
-    FARPROC wineVer = GetProcAddress(ntdll, "wine_get_version");
-    return wineVer != nullptr;
-}
-
 bool CreateDDObjects(HWND hwnd_param) {
     std::lock_guard<std::mutex> lock(renderMutex);
     static int callCount = 0;
@@ -361,18 +346,7 @@ bool CreateDDObjects(HWND hwnd_param) {
         wasInGameOrEditor = false;
     }
 
-    // Проверка использования памяти перед входом в игру или редактор
-    if ((InGame || InEditor) && !wasInGameOrEditor) {
-        size_t memoryUsage = GetProcessMemoryUsage();
-        if (memoryUsage > 1ULL * 1024 * 1024 * 1024) {
-            RestartProcess();
-        }
-    }
-
     wasInGameOrEditor = InGame || InEditor;
-
-    bool isWine = IsRunningUnderWine_ByNtDll();
-    bool needRecreateWindow = (callCount > 1 && (wasInGameOrEditor && !InGame && !InEditor) && !isWine);
 
     DDError = FALSE;
     CurrentSurface = TRUE;
@@ -386,7 +360,7 @@ bool CreateDDObjects(HWND hwnd_param) {
     gBackTexture = nullptr;
     if (gRenderer) SDL_DestroyRenderer(gRenderer);
     gRenderer = nullptr;
-    if (gWindow && needRecreateWindow) {
+    if (gWindow) {
         SDL_DestroyWindow(gWindow);
         gWindow = nullptr;
     }
@@ -425,16 +399,14 @@ bool CreateDDObjects(HWND hwnd_param) {
     if (RealLx <= 0) RealLx = 800;
     if (RealLy <= 0) RealLy = 600;
 
+    gWindow = SDL_CreateWindowFrom(hwnd_param);
     if (!gWindow) {
-        gWindow = SDL_CreateWindowFrom(hwnd_param);
-        if (!gWindow) {
-            char errorMsg[256], convertedMsg[256];
-            sprintf(errorMsg, "SDL_CreateWindowFrom failed: %s", SDL_GetError());
-            ConvertUTF8ToWindows1251(errorMsg, convertedMsg, 256);
-            MessageBoxA(NULL, convertedMsg, "SDL Error", MB_OK | MB_ICONERROR);
-            SDL_Quit();
-            return false;
-        }
+        char errorMsg[256], convertedMsg[256];
+        sprintf(errorMsg, "SDL_CreateWindowFrom failed: %s", SDL_GetError());
+        ConvertUTF8ToWindows1251(errorMsg, convertedMsg, 256);
+        MessageBoxA(NULL, convertedMsg, "SDL Error", MB_OK | MB_ICONERROR);
+        SDL_Quit();
+        return false;
     }
 
     hwnd = hwnd_param;
@@ -459,29 +431,21 @@ bool CreateDDObjects(HWND hwnd_param) {
         SetWindowPos(hwnd_param, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     }
     if ((InGame || InEditor) && window_mode) {
-        if (isWine) {
-            SDL_SetWindowFullscreen(gWindow, SDL_WINDOW_FULLSCREEN_DESKTOP);
-            SDL_Delay(100);
-        }
-        else {
-            SDL_SetWindowFullscreen(gWindow, SDL_WINDOW_FULLSCREEN);
-            SDL_Delay(100);
-        }
+        SDL_SetWindowFullscreen(gWindow, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        SDL_Delay(100);
         SDL_SetWindowSize(gWindow, RealLx, RealLy);
         SDL_SetWindowPosition(gWindow, 0, 0);
         SDL_SetWindowGrab(gWindow, SDL_TRUE);
         SDL_ShowCursor(SDL_DISABLE);
         SDL_SetWindowResizable(gWindow, SDL_FALSE);
-        if (!isWine) {
-            LONG style = GetWindowLong(hwnd_param, GWL_STYLE);
-            style &= ~WS_CAPTION;
-            style &= ~WS_SYSMENU;
-            style &= ~WS_MINIMIZEBOX;
-            style &= ~WS_MAXIMIZEBOX;
-            style &= ~WS_THICKFRAME;
-            SetWindowLong(hwnd_param, GWL_STYLE, style);
-            SetWindowPos(hwnd_param, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-        }
+        LONG style = GetWindowLong(hwnd_param, GWL_STYLE);
+        style &= ~WS_CAPTION;
+        style &= ~WS_SYSMENU;
+        style &= ~WS_MINIMIZEBOX;
+        style &= ~WS_MAXIMIZEBOX;
+        style &= ~WS_THICKFRAME;
+        SetWindowLong(hwnd_param, GWL_STYLE, style);
+        SetWindowPos(hwnd_param, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     }
     else if (!window_mode) {
         SDL_SetWindowSize(gWindow, RealLx, RealLy);

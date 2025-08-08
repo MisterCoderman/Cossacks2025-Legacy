@@ -16,7 +16,7 @@ void UdpHolePuncher::Init( const char *server_addr, const unsigned short port,
 
 	interval_ = interval;
 
-	int res = InetPton( AF_INET, server_addr, &server_addr_.sin_addr );
+	int res = (server_addr_.sin_addr.s_addr = inet_addr(server_addr)) != INADDR_NONE ? 1 : 0;
 	if (1 != res)
 	{//Invaild ip address string
 		return;
